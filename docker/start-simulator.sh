@@ -15,5 +15,5 @@ docker run --name="ecs152a-simulator" \
     --cap-add=NET_ADMIN \
     --rm \
     -p 5001:5001/udp \
-    -v "$(pwd)/hdd":/hdd \
+    -v "$(pwd -W)/hdd":/hdd \
     ecs152a/simulator
