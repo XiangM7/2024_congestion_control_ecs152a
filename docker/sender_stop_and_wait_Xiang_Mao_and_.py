@@ -1,22 +1,30 @@
-# sender_stop_and_wait_Xiang_Mao_and_.py
+
 import os
 import socket
 import time
-import sys
+import subprocess
+import signal
 
 PACKET_SIZE = 1024
 SEQ_ID_SIZE = 4
-PAYLOAD_SIZE = PACKET_SIZE - SEQ_ID_SIZE  # 1020
+PAYLOAD_SIZE = PACKET_SIZE - SEQ_ID_SIZE  
 
 DEST_IP = "127.0.0.1"
 DEST_PORT = 5001
 
 RTO = 1.0
+RUNS = 10
 
-PROGRESS_STEP = PAYLOAD_SIZE * 1000  # 1020*1000 bytes (~1MB)
+FILE_IN = "file.mp3"
+FILE_OUT = os.path.join("hdd", "file2.mp3")
+
+READY_TIMEOUT = 30.0   
+FIN_TIMEOUT = 10.0     
+
 
 def make_packet(seq_id: int, payload: bytes) -> bytes:
     return int.to_bytes(seq_id, SEQ_ID_SIZE, signed=True, byteorder="big") + payload
+
 
 def parse_reply(data: bytes):
     if len(data) < SEQ_ID_SIZE:
@@ -25,26 +33,67 @@ def parse_reply(data: bytes):
     msg = data[SEQ_ID_SIZE:]
     return ack_id, msg
 
+
 def metric(throughput_bps: float, avg_delay_s: float) -> float:
-    # Metric = 0.3 * Throughput/1000 + 0.7 / AverageDelay
     if avg_delay_s <= 0:
         return 0.0
     return 0.3 * (throughput_bps / 1000.0) + 0.7 / avg_delay_s
+
+
+def silent_run(cmd):
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start_simulator_silent():
+    # kill any old container name 
+    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
+
+    # start simulator script in background
+    p = subprocess.Popen(
+        ["bash", "./start-simulator.sh"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid,
+    )
+    return p
+
+
+def wait_receiver_ready():
+    # Wait until docker logs contains "Receiver running" 
+    deadline = time.time() + READY_TIMEOUT
+    while time.time() < deadline:
+        r = subprocess.run(
+            ["docker", "logs", "ecs152a-simulator"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if "Receiver running" in r.stdout:
+            return
+        time.sleep(0.2)
+    raise RuntimeError("receiver not ready (timeout)")
+
+
+def stop_simulator(sim_proc):
+    # receiver should exit after FINACK; still do cleanup
+    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
+    try:
+        os.killpg(os.getpgid(sim_proc.pid), signal.SIGTERM)
+    except Exception:
+        pass
+
 
 def run_once(file_path: str):
     total_bytes = os.path.getsize(file_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 0))  # bind to any available port
+    sock.bind(("0.0.0.0", 0))
     sock.settimeout(RTO)
 
     t0 = time.time()
-
     first_send_time = {}
     delays = []
-
     offset = 0
-    last_bucket = 0
 
     with open(file_path, "rb") as f:
         while offset < total_bytes:
@@ -59,7 +108,6 @@ def run_once(file_path: str):
 
             while True:
                 sock.sendto(pkt, (DEST_IP, DEST_PORT))
-
                 try:
                     data, _ = sock.recvfrom(PACKET_SIZE)
                 except socket.timeout:
@@ -71,15 +119,7 @@ def run_once(file_path: str):
 
                 if msg.startswith(b"ack") and ack_id >= offset + len(payload):
                     delays.append(time.time() - first_send_time[offset])
-                    old_offset = offset
                     offset += len(payload)
-
-                    # Print progress about every ~1MB (to stderr)
-                    old_bucket = old_offset // PROGRESS_STEP
-                    new_bucket = offset // PROGRESS_STEP
-                    if new_bucket != old_bucket:
-                        print(f"{offset}/{total_bytes}", file=sys.stderr)
-
                     break
 
     # Final empty packet
@@ -88,10 +128,14 @@ def run_once(file_path: str):
 
     fin_ack_received = False
     fin_seen = False
+    deadline = time.time() + FIN_TIMEOUT
 
     while not (fin_ack_received and fin_seen):
-        sock.sendto(fin_pkt, (DEST_IP, DEST_PORT))
+        if time.time() > deadline:
+           
+            raise RuntimeError("finish handshake timeout")
 
+        sock.sendto(fin_pkt, (DEST_IP, DEST_PORT))
         try:
             data, _ = sock.recvfrom(PACKET_SIZE)
         except socket.timeout:
@@ -106,7 +150,6 @@ def run_once(file_path: str):
         if msg.startswith(b"fin"):
             fin_seen = True
 
-    # Send FINACK 
     sock.sendto(make_packet(0, b"==FINACK=="), (DEST_IP, DEST_PORT))
 
     t1 = time.time()
@@ -118,13 +161,42 @@ def run_once(file_path: str):
     perf = metric(throughput, avg_delay)
     return throughput, avg_delay, perf
 
-def main():
-    thr, dly, met = run_once("file.mp3")
 
-    # stdout:three floats 
-    print(f"{thr:.7f}")
-    print(f"{dly:.7f}")
-    print(f"{met:.7f}")
+def main():
+    # Must run from directory
+    if not os.path.exists("./start-simulator.sh"):
+        raise SystemExit("Run from docker/ directory.")
+    if not os.path.exists(FILE_IN):
+        raise SystemExit("file.mp3 not found in docker/ directory.")
+
+    thr_list, dly_list, met_list = [], [], []
+
+    for _ in range(RUNS):
+        # clean receiver output file each run
+        try:
+            os.remove(FILE_OUT)
+        except FileNotFoundError:
+            pass
+
+        sim = start_simulator_silent()
+        try:
+            wait_receiver_ready()
+            thr, dly, met = run_once(FILE_IN)
+            thr_list.append(thr)
+            dly_list.append(dly)
+            met_list.append(met)
+        finally:
+            stop_simulator(sim)
+
+    thr_avg = sum(thr_list) / RUNS
+    dly_avg = sum(dly_list) / RUNS
+    met_avg = sum(met_list) / RUNS
+
+    
+    print(f"{thr_avg:.7f}")
+    print(f"{dly_avg:.7f}")
+    print(f"{met_avg:.7f}")
+
 
 if __name__ == "__main__":
     main()
