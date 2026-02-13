@@ -2,6 +2,8 @@ import socket
 import os
 import time
 from datetime import datetime
+import subprocess
+import signal
 
 # total packet size
 PACKET_SIZE = 1024
@@ -15,6 +17,13 @@ WINDOW_SIZE = 100
 DEST_IP = "127.0.0.1"
 DEST_PORT = 5001
 RTO = 1.0
+
+RUNS = 10
+READY_TIMEOUT = 120.0
+FIN_TIMEOUT = 10.0
+
+FILE_IN = "file.mp3"
+FILE_OUT = os.path.join("hdd", "file2.mp3")
 
 
 def make_packet(seq_id: int, payload: bytes) -> bytes:
@@ -37,10 +46,50 @@ def metric(throughput_bps: float, avg_delay_s: float) -> float:
 # we init the seq to 0 and check that it isn't above the size of the file(so we know when to stop)
 # we then populate the window(read from disk, store packet info, and begin tracking the ack)
 # then we send the packets in the window, and then we wait for the acks
-# the biggest difference is that now we have to wait for at least the first to come back before shifting the window
+# the biggest difference is that now we just have to wait for at least the first to come back before shifting the window,
+# instead of all the packets in the window
+# if a packet is stuck, we can remove it and resend the lowest unacked packet(this is like fast retransmit)
+# if we timeout, we can resend the lowest unacked packet
+# then we do the fin handshake and send the finack
  
  
- 
+ # these functions are the same as the other file to allow for th 10x run
+
+def silent_run(cmd):
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def start_simulator_silent():
+    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
+
+    p = subprocess.Popen(
+        ["bash", "./start-simulator.sh"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    return p
+
+def wait_receiver_ready():
+    deadline = time.time() + READY_TIMEOUT
+    while time.time() < deadline:
+        r = subprocess.run(
+            ["docker", "logs", "ecs152a-simulator"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if "Receiver running" in r.stdout:
+            return
+        time.sleep(0.2)
+    raise RuntimeError("receiver not ready (timeout)")
+
+def stop_simulator(sim_proc):
+    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
+    try:
+        os.killpg(os.getpgid(sim_proc.pid), signal.SIGTERM)
+    except Exception:
+        pass
+
 
 def run_once():
 # udp socket like the discussion file
@@ -139,14 +188,13 @@ def run_once():
                         delays.append(now - first_send_time[sid])
                         del in_flight[sid]
 
-                    # fast retransmit: if we're stuck on same ACK, resend the lowest unacked packet
+                    # if we are stuck on an ack, we can remove it and resend the lowest unacked packet(this is like fast retransmit)
                     if dup_acks >= 3 and in_flight:
                         base = min(in_flight.keys())
                         udp_socket.sendto(make_packet(base, in_flight[base]), (DEST_IP, DEST_PORT))
 
                 except socket.timeout:
-
-                    # retransmit all outstanding packets (simple + robust)
+                    # if we timeout, we can resend the lowest unacked packet
                     for sid, payload in list(in_flight.items()):
                         udp_socket.sendto(make_packet(sid, payload), (DEST_IP, DEST_PORT))
 
@@ -157,8 +205,12 @@ def run_once():
 
         fin_ack_received = False
         fin_seen = False
+        deadline = time.time() + FIN_TIMEOUT
 
         while not (fin_ack_received and fin_seen):
+            if time.time() > deadline:
+                raise RuntimeError("finish handshake timeout")
+
             udp_socket.sendto(fin_pkt, (DEST_IP, DEST_PORT))
 
             try:
@@ -206,10 +258,38 @@ def run_10_times():
     print(f"{avg_met:.7f}")
 
 def main():
-    thr, dly, met = run_once()
-    print(f"{thr:.7f}")
-    print(f"{dly:.7f}")
-    print(f"{met:.7f}")
+    # Must run from docker/ directory
+    if not os.path.exists("./start-simulator.sh"):
+        raise SystemExit("Run from docker/ directory.")
+    if not os.path.exists(FILE_IN):
+        raise SystemExit("file.mp3 not found in docker/ directory.")
+
+    thr_list, dly_list, met_list = [], [], []
+
+    for _ in range(RUNS):
+        # clean receiver output file each run
+        try:
+            os.remove(FILE_OUT)
+        except FileNotFoundError:
+            pass
+
+        sim = start_simulator_silent()
+        try:
+            wait_receiver_ready()
+            thr, dly, met = run_once()
+            thr_list.append(thr)
+            dly_list.append(dly)
+            met_list.append(met)
+        finally:
+            stop_simulator(sim)
+
+    thr_avg = sum(thr_list) / RUNS
+    dly_avg = sum(dly_list) / RUNS
+    met_avg = sum(met_list) / RUNS
+
+    print(f"{thr_avg:.7f}")
+    print(f"{dly_avg:.7f}")
+    print(f"{met_avg:.7f}")
     # run_10_times()
 
 if __name__ == "__main__":

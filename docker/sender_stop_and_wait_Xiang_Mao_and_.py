@@ -53,7 +53,7 @@ def start_simulator_silent():
         ["bash", "./start-simulator.sh"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        preexec_fn=os.setsid,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     return p
 
