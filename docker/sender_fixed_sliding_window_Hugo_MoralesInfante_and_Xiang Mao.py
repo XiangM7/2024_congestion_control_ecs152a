@@ -18,8 +18,8 @@ DEST_IP = "127.0.0.1"
 DEST_PORT = 5001
 RTO = 1.0
 
-RUNS = 10
-READY_TIMEOUT = 120.0
+# RUNS = 10
+# READY_TIMEOUT = 30.0
 FIN_TIMEOUT = 10.0
 
 FILE_IN = "file.mp3"
@@ -50,45 +50,7 @@ def metric(throughput_bps: float, avg_delay_s: float) -> float:
 # instead of all the packets in the window
 # if a packet is stuck, we can remove it and resend the lowest unacked packet(this is like fast retransmit)
 # if we timeout, we can resend the lowest unacked packet
-# then we do the fin handshake and send the finack
- 
- 
- # these functions are the same as the other file to allow for th 10x run
 
-def silent_run(cmd):
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def start_simulator_silent():
-    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
-
-    p = subprocess.Popen(
-        ["bash", "./start-simulator.sh"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-    )
-    return p
-
-def wait_receiver_ready():
-    deadline = time.time() + READY_TIMEOUT
-    while time.time() < deadline:
-        r = subprocess.run(
-            ["docker", "logs", "ecs152a-simulator"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        if "Receiver running" in r.stdout:
-            return
-        time.sleep(0.2)
-    raise RuntimeError("receiver not ready (timeout)")
-
-def stop_simulator(sim_proc):
-    silent_run(["docker", "rm", "-f", "ecs152a-simulator"])
-    try:
-        os.killpg(os.getpgid(sim_proc.pid), signal.SIGTERM)
-    except Exception:
-        pass
 
 
 def run_once():
@@ -197,6 +159,8 @@ def run_once():
                     # if we timeout, we can resend the lowest unacked packet
                     for sid, payload in list(in_flight.items()):
                         udp_socket.sendto(make_packet(sid, payload), (DEST_IP, DEST_PORT))
+                except ConnectionResetError:
+                    continue
 
         # send final closing message
         # Final empty packet
@@ -216,6 +180,8 @@ def run_once():
             try:
                 data, _ = udp_socket.recvfrom(PACKET_SIZE)
             except socket.timeout:
+                continue
+            except ConnectionResetError:
                 continue
 
             ack_id, msg = parse_reply(data)
@@ -238,6 +204,7 @@ def run_once():
         perf = metric(throughput, avg_delay)
         return throughput, avg_delay, perf
 
+# this doesn't work on my machine, doing it manually instead
 def run_10_times():
     throughputs = []
     delays = []
@@ -258,39 +225,10 @@ def run_10_times():
     print(f"{avg_met:.7f}")
 
 def main():
-    # Must run from docker/ directory
-    if not os.path.exists("./start-simulator.sh"):
-        raise SystemExit("Run from docker/ directory.")
-    if not os.path.exists(FILE_IN):
-        raise SystemExit("file.mp3 not found in docker/ directory.")
-
-    thr_list, dly_list, met_list = [], [], []
-
-    for _ in range(RUNS):
-        # clean receiver output file each run
-        try:
-            os.remove(FILE_OUT)
-        except FileNotFoundError:
-            pass
-
-        sim = start_simulator_silent()
-        try:
-            wait_receiver_ready()
-            thr, dly, met = run_once()
-            thr_list.append(thr)
-            dly_list.append(dly)
-            met_list.append(met)
-        finally:
-            stop_simulator(sim)
-
-    thr_avg = sum(thr_list) / RUNS
-    dly_avg = sum(dly_list) / RUNS
-    met_avg = sum(met_list) / RUNS
-
-    print(f"{thr_avg:.7f}")
-    print(f"{dly_avg:.7f}")
-    print(f"{met_avg:.7f}")
-    # run_10_times()
+    thr, dly, met = run_once()
+    print(f"Throughput: {thr:.7f}")
+    print(f"Delay: {dly:.7f}")
+    print(f"Metric: {met:.7f}")
 
 if __name__ == "__main__":
     main()
